@@ -10,7 +10,11 @@ rem Stage everything, commit only if something changed.
 git add -A
 git diff --cached --quiet
 if not errorlevel 1 goto :push_only
-if "%~1"=="" (set "MSG=Update") else (set "MSG=%*")
+
+rem Build the commit message: all arguments joined, enclosing quotes stripped.
+set "MSG=%*"
+set MSG=%MSG:"=%
+if "%MSG%"=="" set MSG=Update
 git commit -q -m "%MSG%"
 if errorlevel 1 goto :failed
 

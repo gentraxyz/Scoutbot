@@ -1,0 +1,92 @@
+const { Events, PermissionFlagsBits } = require('discord.js');
+const ai = require('./ai');
+const memory = require('./memory');
+const config = require('./config');
+const { splitText } = require('./utils');
+
+// Phrases that usually mean the admin wants a standing rule kept, not a one-off question.
+const INSTRUCTION_HINT = /\b(remember|from now on|going forward|always|never|don'?t ever|make sure|rule|please (?:do )?(?:not )?(?:use|call|say|reply|answer|speak))\b/i;
+
+// Admins (Manage Server) teaching the bot a rule for the whole server. Saved as a server instruction.
+async function captureInstruction(message, question) {
+  if (!message.guild || !INSTRUCTION_HINT.test(question)) return false;
+  if (!message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)) return false;
+
+  const rule = await ai.extractInstruction(question);
+  if (!rule) return false;
+
+  const saved = memory.addInstruction(message.guild.id, rule);
+  if (saved === 'full') {
+    await message.reply(`I already have ${memory.MAX_INSTRUCTIONS} server rules. Remove one with /memory server-forget first.`).catch(() => {});
+    return true;
+  }
+  if (saved) await message.reply(`Got it, I'll always remember this in this server: *${saved.text}*`).catch(() => {});
+  return Boolean(saved);
+}
+
+// True when the message replies to a message the bot itself sent (no mention needed).
+async function repliesToBot(message, client) {
+  const refId = message.reference?.messageId;
+  if (!refId || typeof message.channel?.messages?.fetch !== 'function') return false;
+  const ref = await message.channel.messages.fetch(refId).catch(() => null);
+  return ref?.author?.id === client.user.id;
+}
+
+// In a server the bot answers when mentioned, when in the dedicated AI channel,
+// or when someone replies to one of its messages. In a DM every message is a question.
+// Returns null when the message should be ignored, otherwise the question text.
+async function questionOf(message, client) {
+  const content = message.content ?? '';
+  if (message.guild) {
+    const channelId = message.channelId ?? message.channel?.id;
+    const inAiChannel = channelId === config.aiChannelId;
+    // No fetch needed in the AI channel: everything there is already a question.
+    const replying = !inAiChannel && (await repliesToBot(message, client).catch(() => false));
+    if (!inAiChannel && !message.mentions.has(client.user) && !replying) return null;
+    return content.replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '').trim();
+  }
+  return content.trim();
+}
+
+// Message handler for chat replies: mentions, replies and AI channel in servers, plain conversation in DMs.
+function register(client) {
+  client.on(Events.MessageCreate, async (message) => {
+    if (message.author.bot) return;
+    const isDM = !message.guild;
+    const question = await questionOf(message, client);
+    if (question === null) return;
+
+    if (!question) {
+      const hint = message.attachments.size
+        ? 'I can only read text for now. Send your question as text.'
+        : 'Yes? Ask me something.';
+      await (isDM ? message.channel.send(hint) : message.reply(hint)).catch(() => {});
+      return;
+    }
+
+    if (await captureInstruction(message, question).catch(() => false)) return;
+
+    await message.channel.sendTyping().catch(() => {});
+    // The typing indicator only lasts a few seconds; refresh it while the AI thinks.
+    const typing = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
+    try {
+      const answer = await ai.chat({
+        channelId: message.channelId ?? message.channel.id,
+        guildId: message.guild?.id,
+        botName: client.user.username,
+        userId: message.author.id,
+        speaker: message.author.username,
+        question,
+      });
+      const [first, ...rest] = splitText(answer);
+      await message.reply(first);
+      for (const part of rest) await message.channel.send(part);
+    } catch (err) {
+      await message.reply(`⚠️ ${err.message}`).catch(() => {});
+    } finally {
+      clearInterval(typing);
+    }
+  });
+}
+
+module.exports = { register, questionOf };
